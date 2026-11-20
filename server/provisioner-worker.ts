@@ -170,6 +170,9 @@ async function run(job: ProvisioningJob) {
     await pve.task(await pve.call("POST", pve.path(pve.template, templateNode) + "/clone", { newid: state.vmid, name: "bh-" + job.id,
       description: "Blockhost job " + job.id, full: 1, storage: pve.storage, pool: pve.pool, target: state.node }));
     await ownedVm(state);
+    await stage(job, "Waiting for cloned disks on " + state.node);
+    await pve.waitForCloneDisks(state.vmid, state.node);
+    await stage(job, "Configuring resources and starting the private Minecraft VM on " + state.node);
     await pve.call("PUT", pve.path(state.vmid, state.node) + "/config", {
       cores: job.vcpus, memory: job.ram_mb, balloon: 0, onboot: 1, ciuser: "mcdeploy",
       sshkeys: encodeURIComponent(state.maintenance.public), ipconfig0: `ip=${state.ip}/24,gw=${required("HOSTING_GATEWAY_IP")}`,

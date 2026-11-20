@@ -107,6 +107,23 @@ export class Proxmox {
     if (matches.length !== 1 || matches[0].node !== node || matches[0].type !== "qemu") throw new Error("VM location differs from its provisioning journal.");
     return true;
   }
+  async waitForCloneDisks(id: number, node: string): Promise<void> {
+    const config = await this.config(id, node);
+    const expected = ["ide0", "ide2"].map((drive) => {
+      const value = config[drive];
+      if (typeof value !== "string" || !value.startsWith(`${this.storage}:${id}/`)) throw new Error("Unexpected cloned disk configuration.");
+      return value.split(",")[0];
+    });
+    for (let attempt = 0; attempt < 45; attempt++) {
+      const volumes = await this.call("GET", `/nodes/${node}/storage/${this.storage}/content?content=images&vmid=${id}`);
+      if (!Array.isArray(volumes) || volumes.some((volume: unknown) =>
+        !record(volume) || typeof volume.volid !== "string")) throw new Error("Invalid target-node storage inventory.");
+      const visible = new Set(volumes.map((volume: { volid: string }) => volume.volid));
+      if (expected.every((volume) => visible.has(volume))) return;
+      if (attempt < 44) await delay(2000);
+    }
+    throw new Error("Cloned disks did not become visible on the target node.");
+  }
   async task(value: unknown) {
     const node = typeof value === "string" ? value.match(/^UPID:([a-zA-Z0-9_-]+):/)?.[1] : undefined;
     if (!node || !this.nodes.includes(node)) throw new Error("Missing or out-of-scope Proxmox task identifier.");

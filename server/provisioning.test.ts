@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import test from "node:test";
+import test, { TestContext } from "node:test";
 import { mkdtempSync, rmdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -65,7 +65,7 @@ test("Proxmox DELETE parameters use the query string, never a rejected request b
   assert.equal(calls[0].url.searchParams.get("destroy-unreferenced-disks"), "1");
   assert.equal(calls[0].body, "");
 });
-test("cross-node VM and task operations follow their actual nodes; incomplete audit never silently falls back", async (t) => {
+function proxmoxFixture(t: TestContext) {
   const directory = mkdtempSync(path.join(tmpdir(), "blockhost-placement-"));
   const certificate = path.join(directory, "ca.pem");
   writeFileSync(certificate, rootCertificates[0]);
@@ -80,7 +80,10 @@ test("cross-node VM and task operations follow their actual nodes; incomplete au
     }
     rmSync(certificate); rmdirSync(directory);
   });
-  const pve = new Proxmox();
+  return new Proxmox();
+}
+test("cross-node VM and task operations follow their actual nodes; incomplete audit never silently falls back", async (t) => {
+  const pve = proxmoxFixture(t);
   const calls: string[] = [];
   t.mock.method(pve, "call", async (_method: string, suffix: string) => {
     calls.push(suffix);
@@ -115,6 +118,31 @@ test("cross-node VM and task operations follow their actual nodes; incomplete au
   await assert.rejects(velocityRoute(pve, "bh-new", "new.krumpy.xyz", "10.0.0.202"), /Write failed/);
   assert.ok(update.startsWith("set -euo pipefail\n/usr/bin/python3"));
   assert.ok(!update.includes("/usr/bin/node"));
+});
+test("cross-node clones wait for both boot and Cloud-Init disks on the target, with bounded failure", async (t) => {
+  const pve = proxmoxFixture(t);
+  const boot = "truenas:121/vm-121-disk-0.qcow2", seed = "truenas:121/vm-121-cloudinit.qcow2";
+  t.mock.method(pve, "config", async () => ({ ide0: boot + ",size=32G", ide2: seed + ",media=cdrom" }));
+  const timeout = global.setTimeout;
+  t.mock.method(global, "setTimeout", (callback: () => void) => timeout(callback, 0));
+  let polls = 0;
+  t.mock.method(pve, "call", async (_method: string, suffix: string) => {
+    assert.equal(suffix, "/nodes/pve03/storage/truenas/content?content=images&vmid=121");
+    polls++;
+    return polls === 1 ? [] : polls === 2 ? [{ volid: boot }] : [{ volid: boot }, { volid: seed }];
+  });
+  await pve.waitForCloneDisks(121, "pve03");
+  assert.equal(polls, 3);
+  polls = 0;
+  t.mock.method(pve, "call", async () => { polls++; return [{ volid: boot }]; });
+  await assert.rejects(pve.waitForCloneDisks(121, "pve03"), /did not become visible/);
+  assert.equal(polls, 45);
+  polls = 0;
+  t.mock.method(pve, "call", async () => { polls++; throw new Error("Permission denied"); });
+  await assert.rejects(pve.waitForCloneDisks(121, "pve03"), /Permission denied/);
+  assert.equal(polls, 1);
+  t.mock.method(pve, "config", async () => ({ ide0: "truenas:118/existing.qcow2", ide2: seed }));
+  await assert.rejects(pve.waitForCloneDisks(121, "pve03"), /Unexpected cloned disk/);
 });
 test("proxy route updates preserve existing servers and refuse route/hostname collisions", () => {
   const before = `[servers]\ntry=[]\ntest="10.0.0.102:25565"\n[forced-hosts]\n"test.krumpy.xyz"=["test"]\n[advanced]\n"connection-timeout"=5000\n`;
