@@ -197,6 +197,7 @@ function bytesLabel(bytes) {
 
 async function pollHostedMetrics(generation) {
   await Promise.all(hostedServers.map(async (server) => {
+    if (server.deletionStatus) return;
     try {
       const metrics = await managementApi("/metrics", {}, server.id);
       if (generation !== consoleGeneration || !["overview", "servers"].includes(activePage) || !currentUser || currentUser.demo) return;
@@ -491,8 +492,8 @@ function renderHostedServers() {
     <div class="server-card-top"><div class="server-name"><span class="server-glyph">▦</span><span><strong>${esc(server.name)}</strong><small>${esc(server.software)} ${esc(server.version)} · VM ${esc(server.vmid)}</small></span></div><span id="live-server-state-${esc(server.id)}" class="server-status ${server.state === "active" ? "" : "offline"}"><i></i>${esc(server.state === "active" ? "Online" : server.state || "Not checked")}</span></div>
     <div class="server-card-body"><div><div class="stat-label">VCPU</div><div class="stat-value">${esc(server.vcpus)}</div></div><div><div class="stat-label">MEMORY</div><div class="stat-value">${esc(server.ramMb / 1024)}<small>GiB</small></div></div><div><div class="stat-label">DISK</div><div class="stat-value">${esc(server.diskGb)}<small>GiB</small></div></div></div>
     ${server.error ? `<div class="notice">${esc(server.error)}</div>` : ""}
-    <div class="hosted-live-metrics" id="live-metrics-${esc(server.id)}">Loading measured usage...</div>
-    <div class="server-card-bottom"><span class="server-address">${esc(server.address)}</span><div class="heading-actions"><button class="text-link" data-action="hosted-files" data-id="${esc(server.id)}">Files / SFTP</button><button class="text-link" data-action="hosted-settings" data-id="${esc(server.id)}">Settings</button><button class="button button-primary button-small" data-action="hosted-console" data-id="${esc(server.id)}">Open console</button></div></div>
+    <div class="hosted-live-metrics" id="live-metrics-${esc(server.id)}">${server.deletionStatus ? "Management access revoked." : "Loading measured usage..."}</div>
+    <div class="server-card-bottom"><span class="server-address">${esc(server.address)}</span><div class="heading-actions">${server.deletionStatus ? `<span>${server.deletionStatus === "failed" ? "Deletion paused" : "Deleting..."}</span>` : `<button class="text-link" data-action="hosted-files" data-id="${esc(server.id)}">Files / SFTP</button><button class="text-link" data-action="hosted-settings" data-id="${esc(server.id)}">Settings</button><button class="button button-primary button-small" data-action="hosted-console" data-id="${esc(server.id)}">Open console</button>`}<button class="text-link" data-action="hosted-delete" data-id="${esc(server.id)}" ${server.deletionStatus && server.deletionStatus !== "failed" ? "disabled" : ""}>${server.deletionStatus === "failed" ? "Retry deletion" : "Delete server"}</button></div></div>
   </article>`).join("")}</div>`;
 }
 
@@ -500,20 +501,26 @@ async function pollProvisioningJobs(generation) {
   const accountId = currentUser?.id;
   const valid = () => generation === consoleGeneration && currentUser?.id === accountId && !currentUser?.demo && ["overview", "servers"].includes(activePage);
   try {
-    const response = await fetch("/api/hosting/jobs", { credentials: "same-origin", signal: AbortSignal.timeout(10000) });
-    const jobs = await response.json();
-    if (!response.ok) throw new Error(jobs.error || `Creation progress failed (${response.status}).`);
+    const responses = await Promise.all(["/api/hosting/jobs", "/api/hosting/deletions"].map(url =>
+      fetch(url, { credentials: "same-origin", signal: AbortSignal.timeout(10000) })));
+    const [jobs, deletions] = await Promise.all(responses.map(async response => {
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || `Server operation progress failed (${response.status}).`);
+      return result;
+    }));
     if (!valid()) return;
     const element = document.getElementById("provisioning-jobs");
-    if (element) element.innerHTML = jobs.map((job) => `<div class="notice"><strong>${esc(job.name)}</strong> (${esc(job.hostname)}): ${esc(job.status)} - ${esc(job.stage)}${job.error ? `<p role="alert">${esc(job.error)}</p>` : ""}</div>`).join("");
+    if (element) element.innerHTML = [...jobs.filter(job => job.status !== "deleted"), ...deletions].map((job) => `<div class="notice"><strong>${esc(job.name)}</strong> (${esc(job.hostname)}): ${esc(job.status)} - ${esc(job.stage)}${job.error ? `<p role="alert">${esc(job.error)}</p>` : ""}</div>`).join("");
     const finished = jobs.filter((job) => job.status === "completed" && !completedCreationJobs.has(accountId + ":" + job.id));
     for (const job of finished) completedCreationJobs.add(accountId + ":" + job.id);
-    if (finished.some((job) => !hostedServers.some((server) => server.id === job.id))) await loadHostedServers();
+    const deletionChanged = deletions.some(job => hostedServers.some(server => server.id === job.id &&
+      (job.status === "completed" || job.status === "failed" && server.deletionStatus !== "failed")));
+    if (deletionChanged || finished.some((job) => !hostedServers.some((server) => server.id === job.id))) await loadHostedServers();
   } catch (error) {
     if (valid()) {
-      console.error("Could not load creation progress:", error);
+      console.error("Could not load server operation progress:", error);
       const element = document.getElementById("provisioning-jobs");
-      if (element) element.textContent = `Creation progress unavailable: ${error.message}`;
+      if (element) element.textContent = `Server operation progress unavailable: ${error.message}`;
     }
   } finally { if (valid()) provisioningTimer = window.setTimeout(() => pollProvisioningJobs(generation), 4000); }
 }
@@ -529,6 +536,7 @@ async function loadHostedServers() {
     const result = await response.json();
     if (!response.ok) throw new Error(result.error || `Server lookup failed (${response.status}).`);
     const servers = await Promise.all(result.map(async (server) => {
+      if (server.deletionStatus) return { ...server, state: server.deletionStatus === "failed" ? "Deletion paused" : "Deleting" };
       try {
         const statusResponse = await fetch(`/api/hosted/servers/${encodeURIComponent(server.id)}/console`, { credentials: "same-origin", signal: AbortSignal.timeout(20000) });
         const status = await statusResponse.json();
@@ -909,6 +917,37 @@ async function assignAccountPlan(discordId, planId) {
   }
 }
 
+function deleteHostedServerModal(id) {
+  const server = hostedServers.find(server => server.id === id);
+  if (!server || !currentUser || currentUser.demo) return;
+  const accountId = currentUser.id;
+  openModal({
+    title: "Permanently delete server",
+    subtitle: `Delete ${esc(server.name)} (${esc(server.address)})? This cannot be undone.`,
+    content: `<div class="modal-notice">This stops the server and permanently removes its VM, every world/plugin/file on its disks, DNS route, and SFTP accounts. Connected players will be disconnected. No backup is created. If cleanup fails, the server remains locked until deletion is retried or an administrator resolves it.</div>
+      <label for="delete-server-address">Type ${esc(server.address)} to confirm</label>
+      <input id="delete-server-address" name="confirmAddress" class="form-control" autocomplete="off" spellcheck="false" required>`,
+    submitText: "Permanently delete",
+    onSubmit: async data => {
+      if (currentUser?.id !== accountId || currentUser.demo) throw new Error("Your sign-in changed. Reopen the deletion dialog.");
+      const confirmAddress = String(data.get("confirmAddress"));
+      if (confirmAddress !== server.address) throw new Error("Type the full server address exactly to confirm deletion.");
+      const response = await fetch(`/api/hosting/servers/${encodeURIComponent(id)}`, {
+        method: "DELETE", credentials: "same-origin", signal: AbortSignal.timeout(20000),
+        headers: { "Content-Type": "application/json", "X-Blockhost-Request": "delete" },
+        body: JSON.stringify({ confirmAddress }),
+      });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || `Deletion request failed (${response.status}).`);
+      if (currentUser?.id !== accountId || currentUser.demo) return;
+      closeModal();
+      setPage("servers");
+      await loadHostedServers();
+      showToast("Permanent deletion queued. Follow its progress here.");
+    },
+  });
+}
+
 async function createServerModal() {
   if (currentUser && !currentUser.demo) {
     openModal({
@@ -933,6 +972,7 @@ async function createServerModal() {
           "Automated creation is not available yet. No server will be created or EULA consent recorded.";
         return;
       }
+
       const requestId = crypto.randomUUID();
       openModal({
         title: "Create a Minecraft server",
@@ -1181,6 +1221,7 @@ document.addEventListener("click", (event) => {
   else if (action === "hosted-console") { selectedHostedServerId = id; setPage("console"); }
   else if (action === "hosted-files") { selectedHostedServerId = id; currentDirectory = "/"; setPage("files"); }
   else if (action === "hosted-settings") { selectedHostedServerId = id; setPage("settings"); }
+  else if (action === "hosted-delete") deleteHostedServerModal(id);
   else if (action === "hosted-power") hostedPower(control.dataset.power, control);
   else if (action === "refresh-hosted-servers") { hostedServersLoaded = false; hostedServersError = ""; renderPage(); }
   else if (action === "live-directory") { currentDirectory = control.dataset.path; loadLiveFiles(consoleGeneration); }

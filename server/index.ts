@@ -12,6 +12,7 @@ import path from "path";
 import { createHostedServersRouter } from "./hosted-servers";
 import { createHostingManagement } from "./hosting-management";
 import { addressPool, createProvisioningRouter, provisioningSchema } from "./provisioning";
+import { createDeletionRouter, deletionSchema } from "./deletions";
 
 interface DiscordAccount extends Express.User {
   id: string;
@@ -506,6 +507,7 @@ const hostingManagement = createHostingManagement(pool, decryptHostedKey);
 const provisioningAddresses = process.env.HOSTING_IP_START || process.env.HOSTING_IP_END
   ? addressPool(process.env.HOSTING_IP_START || "", process.env.HOSTING_IP_END || "") : [];
 app.use("/api/hosting", createProvisioningRouter(pool, requireAuthenticated));
+app.use("/api/hosting", createDeletionRouter(pool, requireAuthenticated, adminDiscordIds));
 app.use("/api/hosted/servers", createHostedServersRouter({
   database: pool,
   requireAuthenticated,
@@ -800,6 +802,7 @@ pool
     `);
     await pool.query("CREATE INDEX IF NOT EXISTS sftp_access_expiry_idx ON sftp_access_grants(expires_at)");
     await pool.query(provisioningSchema);
+    await pool.query(deletionSchema);
   })
   .then(() => {
     hostingManagement.start();

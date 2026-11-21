@@ -12,7 +12,7 @@ const server: HostedServer = {
   encrypted_ssh_key: "encrypted-private-key",
 };
 
-async function harness(t: TestContext, output = "active\nMinecraft server output\n", fail = false) {
+async function harness(t: TestContext, output = "active\nMinecraft server output\n", fail = false, deletionStatus?: HostedServer["deletion_status"]) {
   const calls: Array<{ operation: ConsoleOperation; command?: string }> = [];
   const app = express();
   app.use(express.json());
@@ -23,8 +23,8 @@ async function harness(t: TestContext, output = "active\nMinecraft server output
     database: {
       async query(sql, values) {
         return { rows: sql.includes("WHERE id =")
-          ? values[0] === server.id ? [server] : []
-          : values[0] === server.owner_discord_id || values[1] === true ? [server] : [] };
+          ? values[0] === server.id ? [{ ...server, deletion_status: deletionStatus }] : []
+          : values[0] === server.owner_discord_id || values[1] === true ? [{ ...server, deletion_status: deletionStatus }] : [] };
       },
     },
     requireAuthenticated(req, res, next) {
@@ -57,8 +57,24 @@ async function harness(t: TestContext, output = "active\nMinecraft server output
     },
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),
   });
+
   return { request, calls };
 }
+
+test("queued and failed deletions block console, power and all management routes even for admins", async t => {
+  for (const status of ["queued", "failed"] as const) {
+    const { request, calls } = await harness(t, undefined, false, status);
+    for (const user of ["owner", "admin"]) {
+      for (const suffix of ["/console", "/files", "/sftp/access", "/settings", "/metrics"]) {
+        assert.equal((await request("/test-server" + suffix, user)).status, 409);
+      }
+      assert.equal((await request("/test-server/power", user, { action: "start" })).status, 409);
+    }
+    const rows = await (await request("", "owner")).json();
+    assert.equal(rows[0].deletionStatus, status);
+    assert.deepEqual(calls, []);
+  }
+});
 
 test("console requires authentication and server ownership, with explicit admin access", async (t) => {
   const { request, calls } = await harness(t);

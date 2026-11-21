@@ -9,6 +9,8 @@ import { gatewayUser, SftpGateway } from "./hosting-management";
 import { minecraftStatus } from "./minecraft-status";
 import { addressPool, creationInput, enforcePlan, Plan, ProvisioningJob } from "./provisioning";
 import { Cloudflare, delay, Proxmox, provisionSsh, record, required, selectNode, velocityRoute } from "./provisioning-provider";
+import { DeletionJob } from "./deletions";
+import { assertDeletionIdentity, deleteServerResources, DeletionTarget, isDeletionTarget } from "./deletion-worker";
 
 interface Journal {
   id: string; ip: string; vmid: number; node: string; maintenance: utils.KeyPairReturn; console: utils.KeyPairReturn;
@@ -31,9 +33,11 @@ function journalPath(id: string) {
   return path.join(stateDirectory, id + ".json");
 }
 function save(state: Journal) {
-  const filename = journalPath(state.id);
+  savePrivate(journalPath(state.id), state);
+}
+function savePrivate(filename: string, value: unknown) {
   const descriptor = openSync(filename + ".next", "w", 0o600);
-  try { writeFileSync(descriptor, JSON.stringify(state)); fsyncSync(descriptor); }
+  try { writeFileSync(descriptor, JSON.stringify(value)); fsyncSync(descriptor); }
   finally { closeSync(descriptor); }
   renameSync(filename + ".next", filename);
   const directory = openSync(stateDirectory, "r");
@@ -237,6 +241,92 @@ async function run(job: ProvisioningJob) {
     await fail(job, state, false);
   }
 }
+async function deletionTarget(server: HostedServer): Promise<DeletionTarget> {
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,62}$/.test(server.id)) throw new Error("Invalid deletion server ID.");
+  const filename = path.join(stateDirectory, "deletion-" + server.id + ".json");
+  if (existsSync(filename)) {
+    const target: unknown = JSON.parse(readFileSync(filename, "utf8"));
+    if (!isDeletionTarget(target)) throw new Error("Invalid private deletion record.");
+    return target;
+  }
+  let target: DeletionTarget | undefined;
+  if (/^[a-f0-9-]{36}$/.test(server.id)) {
+    const state = load(server.id);
+    if (state?.completed && state.vmid === server.vmid && state.ip === server.ssh_host) {
+      if (!state.fingerprint) throw new Error("Private backend identity is missing.");
+      const original = (await database.query<ProvisioningJob>("SELECT * FROM provisioning_jobs WHERE id=$1", [server.id])).rows[0];
+      if (!original || original.status !== "completed" || original.owner_discord_id !== server.owner_discord_id ||
+          original.hostname !== server.address) throw new Error("Original provisioning ownership is not verified.");
+      const records: DeletionTarget["dnsRecords"] = [];
+      for (const name of [server.address, "_minecraft._tcp." + server.address]) {
+        for (const entry of await dns.records(name)) {
+          if (entry.comment !== "Blockhost job " + server.id) throw new Error("DNS is not owned by the original provisioning job.");
+          records.push(entry);
+        }
+      }
+      target = { id: server.id, owner: server.owner_discord_id, hostname: server.address, ip: server.ssh_host,
+        fingerprint: state.fingerprint, vmid: state.vmid, node: state.node,
+        vmName: "bh-" + server.id, vmDescription: "Blockhost job " + server.id, routeKey: "bh-" + server.id, dnsRecords: records };
+    }
+  }
+  if (!target) {
+    const adoptedFile = "/etc/blockhost-provisioner/adopted-servers.json";
+    if (!existsSync(adoptedFile)) throw new Error("Operator-managed server needs a verified private deletion record.");
+    const adopted: unknown = JSON.parse(readFileSync(adoptedFile, "utf8"));
+    if (!Array.isArray(adopted) || !adopted.every(isDeletionTarget)) throw new Error("Invalid operator adoption records.");
+    target = adopted.find(entry => entry.id === server.id);
+  }
+  if (!target) throw new Error("No private ownership record exists; no resources were deleted.");
+  assertDeletionIdentity(target, server, [9000, pve.template, velocityId, 115, 119]);
+  savePrivate(filename, target);
+  return target;
+}
+async function runDeletion(job: DeletionJob) {
+  const updateStage = async (text: string) => {
+    await database.query("UPDATE server_deletions SET stage=$2,updated_at=NOW() WHERE server_id=$1 AND status='running'", [job.server_id, text]);
+    console.info("Server deletion stage:", { serverId: job.server_id, stage: text });
+  };
+  try {
+    const server = (await database.query<HostedServer>("SELECT * FROM hosted_servers WHERE id=$1", [job.server_id])).rows[0];
+    if (!server || server.owner_discord_id !== job.owner_discord_id || server.address !== job.hostname) throw new Error("Registered server ownership changed.");
+    const target = await deletionTarget(server);
+    await deleteServerResources(server, target, { pve, dns, gateway, velocityId,
+      protectedVmids: [9000, pve.template, velocityId, 115, 119],
+      stage: updateStage, route: target => velocityRoute(pve, target.routeKey, target.hostname, target.ip, true) });
+    await updateStage("Removing registration and releasing resources");
+    const client = await database.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", ["hosting:" + server.owner_discord_id]);
+      const removed = await client.query(`DELETE FROM hosted_servers
+        WHERE id=$1 AND owner_discord_id=$2 AND vmid=$3 AND ssh_host=$4 RETURNING id`,
+      [server.id, server.owner_discord_id, server.vmid, server.ssh_host]);
+      if (removed.rowCount !== 1) throw new Error("Server registration changed during deletion.");
+      await client.query("UPDATE provisioning_jobs SET status='deleted',stage='Server permanently deleted',cleanup_complete=true,updated_at=NOW() WHERE id=$1", [server.id]);
+      await client.query("UPDATE server_deletions SET status='completed',stage='Server permanently deleted',error=NULL,updated_at=NOW() WHERE server_id=$1", [server.id]);
+      await client.query("COMMIT");
+    } catch (error) {
+      try { await client.query("ROLLBACK"); } catch { console.error("Deletion registration rollback failed:", job.server_id); }
+      throw error;
+    } finally { client.release(); }
+    releaseDeletedJournal(server.id);
+    console.info("Server permanently deleted:", { serverId: job.server_id, actorId: job.actor_discord_id });
+  } catch (error) {
+    console.error("Server deletion failed:", { serverId: job.server_id, reason: error instanceof Error ? error.message : "Unknown error" });
+    const current = (await database.query<DeletionJob>("SELECT * FROM server_deletions WHERE server_id=$1", [job.server_id])).rows[0];
+    if (current?.status === "completed") {
+      releaseDeletedJournal(job.server_id);
+      return;
+    }
+    await database.query("UPDATE server_deletions SET status='failed',stage='Deletion paused; retry or contact an administrator',error=$2,updated_at=NOW() WHERE server_id=$1",
+      [job.server_id, "Deletion failed during " + (current?.stage ?? job.stage) + ". Some resources may already be removed; remaining resources are reserved."]);
+  }
+}
+function releaseDeletedJournal(id: string) {
+  if (!/^[a-f0-9-]{36}$/.test(id)) return;
+  const state = load(id);
+  if (state && !state.cleaned) { state.cleaned = true; save(state); }
+}
 async function main() {
   const lock = await database.connect();
   let timer: NodeJS.Timeout | undefined;
@@ -249,8 +339,15 @@ async function main() {
     const interrupted = (await database.query<ProvisioningJob>(
       "SELECT * FROM provisioning_jobs WHERE status='running' OR (status='failed' AND NOT cleanup_complete) ORDER BY created_at")).rows;
     for (const job of interrupted) await fail(job, load(job.id), job.status === "running");
+    const interruptedDeletions = (await database.query<DeletionJob>("SELECT * FROM server_deletions WHERE status='running' ORDER BY created_at")).rows;
+    for (const job of interruptedDeletions) await runDeletion(job);
+    const completedDeletions = (await database.query<Pick<DeletionJob, "server_id">>("SELECT server_id FROM server_deletions WHERE status='completed'")).rows;
+    for (const job of completedDeletions) releaseDeletedJournal(job.server_id);
     await heartbeat();
     for (;;) {
+      const deletion = (await database.query<DeletionJob>(`UPDATE server_deletions SET status='running',stage='Starting deletion',updated_at=NOW()
+        WHERE server_id=(SELECT server_id FROM server_deletions WHERE status='queued' ORDER BY created_at LIMIT 1) RETURNING *`)).rows[0];
+      if (deletion) { await runDeletion(deletion); continue; }
       const job = (await database.query<ProvisioningJob>(`UPDATE provisioning_jobs SET status='running',stage='Starting',updated_at=NOW()
         WHERE id=(SELECT id FROM provisioning_jobs WHERE status='queued' ORDER BY created_at LIMIT 1) RETURNING *`)).rows[0];
       if (job) await run(job); else await delay(2000);

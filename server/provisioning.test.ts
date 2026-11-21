@@ -125,6 +125,7 @@ test("proxy route updates preserve existing servers and refuse route/hostname co
   assert.throws(() => changeVelocityRoute(before, "test", "new.krumpy.xyz", "10.0.0.201", false), /differs/);
   assert.throws(() => changeVelocityRoute(before, "bh-new", "test.krumpy.xyz", "10.0.0.201", true), /another/);
   assert.throws(() => changeVelocityRoute(before.replace("try=[]", 'try=["test"]'), "bh-new", "new.krumpy.xyz", "10.0.0.201", false), /isolated/);
+  assert.throws(() => changeVelocityRoute(before, "test", "different.krumpy.xyz", "10.0.0.102", true), /shared/);
 });
 
 test("provisioning requires an administrator-assigned plan for both availability and creation", async (t) => {

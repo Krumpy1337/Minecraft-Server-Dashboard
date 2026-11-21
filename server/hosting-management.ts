@@ -207,9 +207,11 @@ export function createHostingManagement(database: Pool, decrypt: (value: string)
     ) OR NOT EXISTS (
       SELECT 1 FROM "session" s WHERE s.expire > NOW()
       AND encode(sha256(convert_to(s.sid, 'UTF8')), 'hex')=g.session_hash
-    )`, [(process.env.DISCORD_ADMIN_USER_IDS || "").split(",").map((id) => id.trim()).filter(Boolean)]);
+    ) OR EXISTS (SELECT 1 FROM server_deletions d WHERE d.server_id=g.server_id)`,
+    [(process.env.DISCORD_ADMIN_USER_IDS || "").split(",").map((id) => id.trim()).filter(Boolean)]);
     const grants = (await client.query<Grant>("SELECT server_id, ip, expires_at FROM sftp_access_grants WHERE expires_at > NOW()")).rows;
-    const servers = (await client.query<HostedServer>("SELECT * FROM hosted_servers ORDER BY id")).rows;
+    const servers = (await client.query<HostedServer>(`SELECT * FROM hosted_servers h
+      WHERE NOT EXISTS(SELECT 1 FROM server_deletions d WHERE d.server_id=h.id) ORDER BY id`)).rows;
     const token = await target.token();
     for (const server of servers) {
       const user = await target.user(server, token);

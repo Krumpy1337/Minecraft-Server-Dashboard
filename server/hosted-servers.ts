@@ -16,6 +16,7 @@ export interface HostedServer {
   ssh_host: string;
   ssh_host_fingerprint: string;
   encrypted_ssh_key: string;
+  deletion_status?: "queued" | "running" | "completed" | "failed" | null;
 }
 
 export type ConsoleOperation = "status" | "logs" | "command" | "start" | "stop" | "restart" | "metrics" | "settings-get" | "settings-set";
@@ -112,6 +113,7 @@ function publicServer(server: HostedServer) {
     vcpus: server.vcpus,
     ramMb: server.ram_mb,
     diskGb: server.disk_gb,
+    deletionStatus: server.deletion_status ?? null,
   };
 }
 
@@ -127,7 +129,9 @@ export function createHostedServersRouter(options: Options): Router {
   router.get("/", async (req, res, next) => {
     try {
       const result = await options.database.query(
-        "SELECT * FROM hosted_servers WHERE owner_discord_id = $1 OR $2 ORDER BY created_at DESC",
+        `SELECT hosted_servers.*,
+          (SELECT status FROM server_deletions d WHERE d.server_id=hosted_servers.id) AS deletion_status
+         FROM hosted_servers WHERE owner_discord_id = $1 OR $2 ORDER BY created_at DESC`,
         [req.user!.id, options.adminIds.has(req.user!.id)],
       );
       res.json(result.rows.map(publicServer));
@@ -135,10 +139,16 @@ export function createHostedServersRouter(options: Options): Router {
   });
   router.use("/:id", async (req, res, next) => {
     try {
-      const result = await options.database.query("SELECT * FROM hosted_servers WHERE id = $1", [req.params.id]);
+      const result = await options.database.query(`SELECT hosted_servers.*,
+        (SELECT status FROM server_deletions d WHERE d.server_id=hosted_servers.id) AS deletion_status
+        FROM hosted_servers WHERE id = $1`, [req.params.id]);
       const server = result.rows[0];
       if (!server || (server.owner_discord_id !== req.user!.id && !options.adminIds.has(req.user!.id))) {
         res.status(404).json({ error: "Hosted server not found." });
+        return;
+      }
+      if (server.deletion_status) {
+        res.status(409).json({ error: "This server is being permanently deleted. Failed deletions can be retried from Your servers." });
         return;
       }
       if (!options.credentialsConfigured || !options.allowedHosts.has(server.ssh_host)) {

@@ -14,7 +14,7 @@ export interface Plan {
 }
 export interface ProvisioningJob {
   id: string; owner_discord_id: string; request_id: string; name: string; hostname: string;
-  vcpus: number; ram_mb: number; disk_gb: number; status: "queued" | "running" | "completed" | "failed";
+  vcpus: number; ram_mb: number; disk_gb: number; status: "queued" | "running" | "completed" | "failed" | "deleted";
   stage: string; error: string | null; cleanup_complete: boolean; created_at: Date; updated_at: Date;
   eula_accepted_at: Date;
 }
@@ -51,7 +51,7 @@ export const provisioningSchema = `
     id TEXT PRIMARY KEY, owner_discord_id TEXT NOT NULL REFERENCES discord_accounts(discord_id),
     request_id TEXT NOT NULL, name TEXT NOT NULL, hostname TEXT NOT NULL,
     vcpus INTEGER NOT NULL, ram_mb INTEGER NOT NULL, disk_gb INTEGER NOT NULL,
-    status TEXT NOT NULL DEFAULT 'queued' CHECK(status IN ('queued','running','completed','failed')),
+    status TEXT NOT NULL DEFAULT 'queued' CHECK(status IN ('queued','running','completed','failed','deleted')),
     stage TEXT NOT NULL DEFAULT 'Waiting for provisioner', error TEXT,
     cleanup_complete BOOLEAN NOT NULL DEFAULT false,
     eula_accepted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -59,8 +59,12 @@ export const provisioningSchema = `
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     UNIQUE(owner_discord_id,request_id)
   );
-  CREATE UNIQUE INDEX IF NOT EXISTS provisioning_hostname_reserved
-    ON provisioning_jobs(hostname) WHERE status <> 'failed' OR NOT cleanup_complete;
+  ALTER TABLE provisioning_jobs DROP CONSTRAINT IF EXISTS provisioning_jobs_status_check;
+  ALTER TABLE provisioning_jobs ADD CONSTRAINT provisioning_jobs_status_check
+    CHECK(status IN ('queued','running','completed','failed','deleted'));
+  DROP INDEX IF EXISTS provisioning_hostname_reserved;
+  CREATE UNIQUE INDEX provisioning_hostname_reserved
+    ON provisioning_jobs(hostname) WHERE status NOT IN ('failed','deleted') OR NOT cleanup_complete;
   CREATE TABLE IF NOT EXISTS provisioning_worker (
     id INTEGER PRIMARY KEY CHECK(id=1), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
   );

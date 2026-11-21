@@ -22,12 +22,12 @@ function run(command, args, input) {
   }
   return result.stdout.trim();
 }
-function protect(directory, gid) {
+function protect(directory, gid, uid = 0) {
   const stat = fs.lstatSync(directory);
   if (stat.isSymbolicLink()) throw new Error("Unexpected symlink in worker installation.");
-  fs.chownSync(directory, 0, gid);
+  fs.chownSync(directory, uid, gid);
   fs.chmodSync(directory, stat.isDirectory() ? 0o750 : (stat.mode & 0o111) ? 0o750 : 0o640);
-  if (stat.isDirectory()) for (const name of fs.readdirSync(directory)) protect(path.join(directory, name), gid);
+  if (stat.isDirectory()) for (const name of fs.readdirSync(directory)) protect(path.join(directory, name), gid, uid);
 }
 function updateEnvironment(original, changes) {
   let updated = original;
@@ -92,10 +92,63 @@ function updateWorker(bundle) {
   run("/usr/bin/systemctl", ["start", "blockhost-provisioner"]);
   console.log("Worker updated with a dedicated gateway credential; interrupted and incomplete cleanup jobs will be recovered.");
 }
+function upgradeDeletion(bundle) {
+  for (const name of ["dist/server/deletions.js", "dist/server/deletion-worker.js", "dist/server/provisioner-worker.js",
+    "source/app.js", "source/index.html", "provisioning-schema.sql", "adopted-servers.json"]) {
+    if (!fs.statSync(bundle + "/" + name).isFile()) throw new Error("Incomplete deletion release: " + name);
+  }
+  const adopted = JSON.parse(fs.readFileSync(bundle + "/adopted-servers.json", "utf8"));
+  if (!Array.isArray(adopted)) throw new Error("Invalid adoption records.");
+  const previousAdoptions = configuration + "/adopted-servers.json";
+  if (fs.existsSync(previousAdoptions)) throw new Error("Private adoption records already exist; review this upgrade manually.");
+  const environmentBefore = fs.readFileSync(configuration + "/worker.env", "utf8");
+  const websiteBefore = fs.readFileSync(app + "/.env", "utf8");
+  const role = databaseRole(parseEnv(websiteBefore).DATABASE_URL);
+  if (!/^[a-z_][a-z0-9_]*$/.test(role)) throw new Error("Unexpected website database role.");
+  const busy = run("/usr/sbin/runuser", ["-u", "postgres", "--", "/usr/bin/psql", "-At", "-d", "blockhost"],
+    "SELECT COUNT(*) FROM provisioning_jobs WHERE status IN ('queued','running');");
+  if (busy !== "0") throw new Error("Wait for queued/running creation jobs before upgrading.");
+  const gid = Number(run("/usr/bin/id", ["-g", user]));
+  const next = installation + "/dist.next";
+  if (fs.existsSync(next)) throw new Error("An incomplete code update needs inspection.");
+  fs.cpSync(bundle + "/dist", next, { recursive: true, dereference: true });
+  protect(next, gid);
+  if (!adopted.every(require(next + "/server/deletion-worker.js").isDeletionTarget)) throw new Error("Invalid private adoption identity.");
+  const backup = configuration + "/before-deletion-" + Date.now();
+  fs.mkdirSync(backup, { mode: 0o700 });
+  for (const name of ["dist", "source"]) fs.cpSync(app + "/" + name, backup + "/" + name, { recursive: true });
+  run("/usr/bin/systemctl", ["stop", "blockhost", "blockhost-provisioner"]);
+  run("/usr/sbin/runuser", ["-u", "postgres", "--", "/usr/bin/psql", "-v", "ON_ERROR_STOP=1", "-d", "blockhost"], `
+BEGIN;
+SET ROLE ${role};
+${fs.readFileSync(bundle + "/provisioning-schema.sql", "utf8")}
+RESET ROLE;
+GRANT SELECT,INSERT,DELETE ON hosted_servers TO blockhost_provisioner;
+GRANT SELECT,UPDATE ON server_deletions TO blockhost_provisioner;
+COMMIT;`);
+  fs.writeFileSync(previousAdoptions, JSON.stringify(adopted), { mode: 0o640, flag: "wx" });
+  fs.chownSync(previousAdoptions, 0, gid);
+  fs.renameSync(installation + "/dist", installation + "/dist.previous-" + Date.now());
+  fs.renameSync(next, installation + "/dist");
+  const siteUid = Number(run("/usr/bin/id", ["-u", "blockhost"])), siteGid = Number(run("/usr/bin/id", ["-g", "blockhost"]));
+  for (const name of ["dist", "source"]) {
+    fs.cpSync(bundle + "/" + name, app + "/" + name, { recursive: true });
+    protect(app + "/" + name, siteGid, siteUid);
+  }
+  if (fs.readFileSync(configuration + "/worker.env", "utf8") !== environmentBefore ||
+      fs.readFileSync(app + "/.env", "utf8") !== websiteBefore) throw new Error("Environment changed during code-only upgrade.");
+  run("/usr/bin/systemctl", ["start", "blockhost", "blockhost-provisioner"]);
+  run("/usr/bin/systemctl", ["is-active", "--quiet", "blockhost", "blockhost-provisioner"]);
+  console.log("Deletion upgrade installed; credentials unchanged. No server deletion was requested.");
+}
 function main() {
   if (process.getuid() !== 0) throw new Error("Run this installer as root on the Debian website host.");
   if (typeof parseEnv !== "function") throw new Error("Node.js with util.parseEnv is required.");
   const bundle = fs.realpathSync(process.argv[2] || ".");
+  if (process.argv[3] === "--upgrade-deletion") {
+    upgradeDeletion(bundle);
+    return;
+  }
   if (process.argv[3] === "--update") {
     updateWorker(bundle);
     return;
@@ -151,8 +204,9 @@ CREATE ROLE blockhost_provisioner LOGIN PASSWORD '${password}' NOSUPERUSER NOCRE
 GRANT CONNECT ON DATABASE blockhost TO blockhost_provisioner;
 GRANT USAGE ON SCHEMA public TO blockhost_provisioner;
 GRANT SELECT ON service_plans,discord_accounts TO blockhost_provisioner;
-GRANT SELECT,INSERT ON hosted_servers TO blockhost_provisioner;
+GRANT SELECT,INSERT,DELETE ON hosted_servers TO blockhost_provisioner;
 GRANT SELECT,UPDATE ON provisioning_jobs TO blockhost_provisioner;
+GRANT SELECT,UPDATE ON server_deletions TO blockhost_provisioner;
 GRANT SELECT,INSERT,UPDATE ON provisioning_worker TO blockhost_provisioner;
 COMMIT;`);
   const backup = configuration + "/website-before-install";

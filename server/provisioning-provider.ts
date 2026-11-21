@@ -212,6 +212,9 @@ export function changeVelocityRoute(source: string, key: string, hostname: strin
   const target = ip + ":25565";
   if (servers[key] !== undefined && servers[key] !== target) throw new Error("Existing proxy server differs from this job.");
   if (hosts[hostname] !== undefined && JSON.stringify(hosts[hostname]) !== JSON.stringify([key])) throw new Error("Hostname already routes to another server.");
+  if (remove && Object.entries(hosts).some(([host, keys]) => host !== hostname && Array.isArray(keys) && keys.some(entry => entry === key))) {
+    throw new Error("Proxy route is shared by another hostname; operator review required.");
+  }
   if (remove) { delete servers[key]; delete hosts[hostname]; }
   else { servers[key] = target; hosts[hostname] = [key]; }
   return TOML.stringify(config);
@@ -273,5 +276,11 @@ export class Cloudflare {
         await this.api.call("DELETE", `/zones/${this.zone}/dns_records/${item.id}`);
       }
     }
+  }
+  async deleteRecord(expected: { id: string; name: string; comment?: string }) {
+    const current = (await this.records(expected.name)).find(entry => entry.id === expected.id);
+    if (!current) return;
+    if (current.comment !== expected.comment) throw new Error("DNS ownership changed before deletion.");
+    await this.api.call("DELETE", `/zones/${this.zone}/dns_records/${current.id}`);
   }
 }
